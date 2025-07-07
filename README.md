@@ -11,3 +11,7 @@ This project provides a real-time transcript of a live YouTube stream using Whis
 
   # Requirements
   - [`whisper`](https://github.com/openai/whisper)
+ 
+  # Tools to Consider
+  - Google CLoud STT
+  - Azure STT
