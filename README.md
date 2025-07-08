@@ -10,6 +10,8 @@ This project provides a real-time transcript of a live YouTube stream using Whis
 - Outputs to user
 
   # Requirements
+  - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp)
+  - [`ffmpeg`](https://ffmpeg.org/)
   - [`whisper`](https://github.com/openai/whisper)
  
   # Tools to Consider
