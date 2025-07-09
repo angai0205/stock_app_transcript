@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 
 # Configuration - KEEP THESE THE SAME AS YOUR WORKING VERSION
-YOUTUBE_URL = "https://www.youtube.com/watch?v=isJ7_4bf8KQ"
+YOUTUBE_URL = "https://www.youtube.com/watch?v=MfDZN_gqy0Q"
 MODEL_SIZE = "small"
 USE_GPU = False
 SEGMENT_LENGTH = 10
@@ -79,32 +79,66 @@ def process_stream():
 
     debug_log(f"Stream URL: {stream_url}")
     
-    # Check if this is likely a live stream (HLS)
-    is_live_stream = 'm3u8' in stream_url or 'manifest' in stream_url or 'playlist' in stream_url
+    # Check if this is likely a live stream (HLS or DASH)
+    is_live_stream = any(keyword in stream_url.lower() for keyword in ['m3u8', 'manifest', 'playlist', 'dash'])
     debug_log(f"Detected live stream: {is_live_stream}")
 
     # FFmpeg pipeline - ENHANCED FOR LIVE STREAMS
     try:
         if is_live_stream:
-            # Enhanced configuration for live streams
-            process = (
-                ffmpeg
-                .input(stream_url, 
-                       f='m3u8',  # Explicitly specify HLS format
-                       protocol_whitelist='file,http,https,tcp,tls',
-                       user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                       headers='Referer: https://www.youtube.com/',
-                       live_start_index=0,  # Start from beginning of live stream
-                       fflags='+discardcorrupt+genpts')  # Handle corrupt packets
-                .output('pipe:', 
-                       format='s16le',
-                       acodec='pcm_s16le',
-                       ac=1,
-                       ar=16000,
-                       loglevel='error')
-                .overwrite_output()
-                .run_async(pipe_stdout=True, pipe_stderr=True)
-            )
+            # Enhanced configuration for live streams (both HLS and DASH)
+            input_args = {
+                'protocol_whitelist': 'file,http,https,tcp,tls',
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'headers': 'Referer: https://www.youtube.com/',
+                'fflags': '+discardcorrupt+genpts'
+            }
+            
+            # Add format-specific options
+            if 'm3u8' in stream_url.lower():
+                input_args['f'] = 'm3u8'
+                input_args['live_start_index'] = '0'
+                debug_log("Using HLS configuration")
+            elif 'dash' in stream_url.lower():
+                input_args['f'] = 'dash'
+                debug_log("Using DASH configuration")
+            else:
+                debug_log("Using generic live stream configuration")
+            
+            try:
+                process = (
+                    ffmpeg
+                    .input(stream_url, **input_args)
+                    .output('pipe:', 
+                           format='s16le',
+                           acodec='pcm_s16le',
+                           ac=1,
+                           ar=16000,
+                           loglevel='error')
+                    .overwrite_output()
+                    .run_async(pipe_stdout=True, pipe_stderr=True)
+                )
+                debug_log("Enhanced FFmpeg configuration started successfully")
+            except ffmpeg.Error as e:
+                debug_log(f"Enhanced configuration failed: {e.stderr.decode('utf8', 'replace')}")
+                debug_log("Trying fallback configuration...")
+                
+                # Fallback: simpler configuration
+                process = (
+                    ffmpeg
+                    .input(stream_url, 
+                           protocol_whitelist='file,http,https,tcp,tls',
+                           user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
+                    .output('pipe:', 
+                           format='s16le',
+                           acodec='pcm_s16le',
+                           ac=1,
+                           ar=16000,
+                           loglevel='error')
+                    .overwrite_output()
+                    .run_async(pipe_stdout=True, pipe_stderr=True)
+                )
+                debug_log("Fallback FFmpeg configuration started successfully")
         else:
             # Standard configuration for regular videos
             process = (
@@ -119,33 +153,82 @@ def process_stream():
         debug_log(f"FFmpeg error: {e.stderr.decode('utf8', 'replace')}")
         return
 
-    # Audio processing - SAME AS YOUR WORKING VERSION
+    # Audio processing - ENHANCED FOR LIVE STREAMS
     sample_rate = 16000
     bytes_per_sample = 2
     chunk_size = sample_rate * SEGMENT_LENGTH * bytes_per_sample
     buffer = b''
-    bytes_received = 0  # ONLY ADDITION: Track received bytes
+    bytes_received = 0
     chunks_processed = 0
+    
+    debug_log(f"Chunk size: {chunk_size} bytes ({SEGMENT_LENGTH}s of audio)")
     
     try:
         debug_log("Starting transcription...")
+        last_data_time = time.time()
+        consecutive_empty_reads = 0
+        max_wait_time = 10.0  # Wait up to 10 seconds for data
+        
         while True:
-            # Read audio - SAME AS YOUR WORKING VERSION
-            raw_data = process.stdout.read(4096)
+            # Read audio - ENHANCED FOR LIVE STREAMS
+            raw_data = process.stdout.read(8192)  # Increased buffer size for live streams
+            
             if not raw_data:
-                debug_log("No more audio data received")
-                break
+                consecutive_empty_reads += 1
+                current_time = time.time()
                 
-            bytes_received += len(raw_data)  # ONLY ADDITION: Track bytes
+                # Check if we've been waiting too long
+                if current_time - last_data_time > max_wait_time:
+                    debug_log(f"No audio data for {max_wait_time} seconds, checking FFmpeg status...")
+                    
+                    # Check if FFmpeg process is still running
+                    if process.poll() is not None:
+                        debug_log(f"FFmpeg process has exited with code {process.returncode}")
+                        # Read any remaining stderr output
+                        stderr_output = process.stderr.read().decode('utf8', 'replace')
+                        if stderr_output:
+                            debug_log(f"FFmpeg stderr: {stderr_output}")
+                        break
+                    else:
+                        debug_log("FFmpeg process is still running but not providing data")
+                        # Try to read stderr to see if there are any error messages
+                        try:
+                            stderr_output = process.stderr.read1(1024).decode('utf8', 'replace')
+                            if stderr_output:
+                                debug_log(f"FFmpeg stderr: {stderr_output}")
+                        except:
+                            pass
+                        break
+                
+                # Small delay to prevent excessive CPU usage
+                time.sleep(0.1)
+                continue
+            
+            # Reset counters when we get data
+            consecutive_empty_reads = 0
+            last_data_time = time.time()
+            bytes_received += len(raw_data)
             buffer += raw_data
             
-            # Process chunks - SAME AS YOUR WORKING VERSION
+            # Only log every 10th read to reduce spam
+            if bytes_received % (8192 * 10) == 0:
+                debug_log(f"Received {len(raw_data)} bytes, total: {bytes_received}, buffer: {len(buffer)}")
+            
+            # Process chunks - ENHANCED DEBUGGING
             while len(buffer) >= chunk_size:
                 segment = buffer[:chunk_size]
                 buffer = buffer[chunk_size:]
                 chunks_processed += 1
                 
+                debug_log(f"Processing chunk {chunks_processed} ({len(segment)} bytes)")
+                
+                # Convert to numpy array
                 audio_np = np.frombuffer(segment, dtype=np.int16).astype(np.float32) / 32768.0
+                
+                # Check if audio has actual content (not just silence)
+                audio_rms = np.sqrt(np.mean(audio_np**2))
+                if audio_rms < 0.001:  # Very low volume
+                    debug_log(f"Chunk {chunks_processed} appears to be silence (RMS: {audio_rms:.6f})")
                 
                 try:
                     segments, info = model.transcribe(
@@ -154,21 +237,41 @@ def process_stream():
                         language="en",
                         vad_filter=True
                     )
-                    for segment in segments:
-                        print(f"[{segment.start:.2f}s] {segment.text}")
+                    
+                    if segments:
+                        for segment in segments:
+                            print(f"[{segment.start:.2f}s] {segment.text}")
+                    else:
+                        debug_log(f"Chunk {chunks_processed}: No speech detected")
                         
                 except Exception as e:
-                    debug_log(f"Transcription error: {str(e)}")
+                    debug_log(f"Transcription error in chunk {chunks_processed}: {str(e)}")
             
-            # ONLY ADDITION: Periodic status
+            # Periodic status - ENHANCED
             if bytes_received % (1024 * 100) == 0:  # Log every ~100KB
-                debug_log(f"Received {bytes_received/1024:.1f}KB, processed {chunks_processed} chunks...")
+                debug_log(f"Received {bytes_received/1024:.1f}KB, processed {chunks_processed} chunks, buffer: {len(buffer)} bytes")
 
     except KeyboardInterrupt:
         debug_log("\nStopping transcription...")
     finally:
         process.terminate()
         debug_log(f"Finished. Total received: {bytes_received/1024:.1f}KB, processed {chunks_processed} chunks")
+        
+        # Process any remaining buffer
+        if len(buffer) > 0:
+            debug_log(f"Processing final {len(buffer)} bytes of buffer...")
+            try:
+                audio_np = np.frombuffer(buffer, dtype=np.int16).astype(np.float32) / 32768.0
+                segments, info = model.transcribe(
+                    audio_np,
+                    beam_size=5,
+                    language="en",
+                    vad_filter=True
+                )
+                for segment in segments:
+                    print(f"[{segment.start:.2f}s] {segment.text}")
+            except Exception as e:
+                debug_log(f"Error processing final buffer: {str(e)}")
 
 if __name__ == "__main__":
     process_stream()
