@@ -1,142 +1,215 @@
-import yt_dlp
-import whisper
-import numpy as np
 import subprocess
+import numpy as np
+from faster_whisper import WhisperModel
+import ffmpeg
 import time
-from typing import Optional
 import logging
-from dataclasses import dataclass
+import os
+import librosa
+from scipy import signal 
 
+# Configuration
+YOUTUBE_URL = "https://www.youtube.com/watch?v=lsx5ErH3k5o"
+MODEL_SIZE = "base"  # Good balance of speed and accuracy
+SEGMENT_LENGTH = 5  # Process 5-second chunks
+READ_TIMEOUT = 10  # Seconds to wait for data
+MAX_RETRIES = 3  # Max connection attempts
+BUFFER_SIZE = 4096  # Read buffer size
+
+# Logging setup
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=logging.WARNING,
+    format='[%(asctime)s.%(msecs)03d] %(message)s',
+    datefmt='%H:%M:%S',
+    handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
 
-@dataclass
-class TranscriberConfig:
-    chunk_duration: int = 10  # seconds per chunk
-    model_size: str = "base"  # Whisper model size
-    sample_rate: int = 16000  # audio sample rate
-    language: str = "en"      # transcription language
+def get_hls_url():
+    """Get stream URL with live stream support"""
+    # For live streams, try these formats in order
+    formats_to_try = [
+        "best[ext=m4a]",  # Best audio quality
+        "bestaudio[ext=m4a]",  # Best audio in m4a
+        "best[height<=720]",  # Fallback to video with audio
+        "bestaudio",  # Any best audio
+        "best",  # Final fallback
+    ]
+    
+    for fmt in formats_to_try:
+        try:
+            cmd = [
+                "yt-dlp",
+                "-g",
+                "-f", fmt,
+                "--no-check-certificates",
+                "--force-ipv4",
+                YOUTUBE_URL
+            ]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True, timeout=15, check=True)  # Longer timeout for live
+            
+            url = result.stdout.strip()
+            if url:
+                logger.info(f"Success with format: {fmt}")
+                return url.split('\n')[-1]
+            
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Format {fmt} failed: {e.stderr[:200]}...")
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Timeout getting URL for format {fmt}")
+    
+    logger.error("All format attempts failed")
+    return None
 
-class YouTubeTranscriber:
-    def __init__(self, config: TranscriberConfig):
-        self.config = config
-        self.model = whisper.load_model(config.model_size)
-        self.ffmpeg_process: Optional[subprocess.Popen] = None
+def is_live_stream(url):
+    """Check if URL is a live stream"""
+    try:
+        cmd = ["yt-dlp", "--print", "is_live", url]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                              text=True, timeout=10, check=True)
+        return result.stdout.strip().lower() == "true"
+    except:
+        return False
 
-    # Converts the YouTube URL into an audio URL of the last 10 seconds of the stream
-    def _get_audio_url(self, youtube_url: str) -> str:
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': True,
+def setup_stream(url, is_live=False):
+    """Configure FFmpeg for streaming with live stream optimizations"""
+    try:
+        input_options = {
+            'headers': 'Referer: https://www.youtube.com\r\nUser-Agent: Mozilla/5.0',
+            'fflags': '+discardcorrupt+genpts+nobuffer',
+            'flags': 'low_delay',
+            'timeout': '10000000',
         }
-
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(youtube_url, download=False)
-                if info is None:
-                    raise ValueError("Invalid YouTube URL")
-                
-                # Loops through all formats and returns the first one that has an audio codec
-                for f in info.get('formats', []):
-                    if f.get('acodec') != 'none':
-                        return f['url']
-                
-                raise ValueError("No audio stream found in available formats")
-        except Exception as e:
-            raise Exception("Failed to get audio URL")
-
-    # Turns the audio URL into a subprocess object for whisper to process
-    def _ffmpeg_stream(self, audio_url: str) -> subprocess.Popen:
-        ffmpeg_cmd = [
-            'C:\\Tools\\ffmpeg\\bin\\ffmpeg.exe'
-            'ffmpeg',
-            '-i', audio_url,
-            '-f', 's16le',
-            '-acodec', 'pcm_s16le',
-            '-ac', '1',
-            '-ar', '16000',
-            '-loglevel', 'error',
-            '-'
-        ]
-
-        try:
-            return subprocess.Popen(
-                ffmpeg_cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.DEVNULL, 
-                bufsize=10**8
+        
+        if is_live:
+            # Additional options for live streams
+            input_options.update({
+                'reconnect': '1',
+                'reconnect_at_eof': '1',
+                'reconnect_streamed': '1',
+                'reconnect_delay_max': '30',
+                'live_start_index': '0',
+            })
+        
+        return (
+            ffmpeg
+            .input(url, **input_options)
+            .output(
+                'pipe:',
+                format='s16le',
+                ac=1,
+                ar=16000,
+                acodec='pcm_s16le',
+                loglevel='error',
+                map='a:0'
             )
-        except Exception as e:
-            raise Exception("Failed to start ffmpeg stream")
-
-    def _process_audio(self, chunk: bytes) -> str:
-        audio_np = np.frombuffer(chunk, dtype=np.int16).flatten().astype(np.float32) / 32768.0
-
-        if len(audio_np) < 1000:
-            return ""
-        
-        result = self.model.transcribe(
-            audio_np,
-            language=self.config.language,
-            fp16=False,
-            verbose=False
+            .global_args('-nostdin')
+            .run_async(pipe_stdout=True, pipe_stderr=True)
         )
-        
-        return result['text'][0].strip() if result['text'] else ""
+    except ffmpeg.Error as e:
+        logger.error(f"FFmpeg setup failed: {e.stderr.decode('utf8', 'replace')}")
+        return None
 
-    def transcribe_stream(self, youtube_url: str):
+def process_audio_stream(process, model):
+    """Core audio processing with HLS optimizations"""
+    sample_rate = 16000
+    chunk_size = sample_rate * SEGMENT_LENGTH * 2  # 16-bit samples
+    buffer = b''
+    last_data_time = time.time()
+    
+    while True:
+        # Check for timeout
+        if time.time() - last_data_time > READ_TIMEOUT:
+            logger.warning(f"No data for {READ_TIMEOUT}s - restarting")
+            return False
+            
+        # Read data
         try:
-            # Step 1: Get audio stream url
-            audio_url = self._get_audio_url(youtube_url)
-
-            # Step 2: Start FFmpeg stream
-            self.ffmpeg_process = self._ffmpeg_stream(audio_url)
-
-            # Step 3: 
-            chuck_size = self.config.sample_rate * self.config.chunk_duration * 2
-
-            # Step 4: Process the stream in small chunks
-            while True: 
-                chunk = self.ffmpeg_process.stdout.read(chuck_size)
-
-                if not chunk:
-                    break
-
-                start_time = time.time()
-                text = self._process_audio(chunk)
-                processing_time = time.time() - start_time
-
-                if text: 
-                    logger.info(f"Transcription ({processing_time:.2f}s): {text}")
-                else: 
-                    logger.warning("Empty transciprtion result")
+            data = os.read(process.stdout.fileno(), BUFFER_SIZE)
+            if not data:
+                time.sleep(0.1)
+                continue
+                
+            last_data_time = time.time()
+            buffer += data
+            
+            # Process complete chunks
+            while len(buffer) >= chunk_size:
+                segment = buffer[:chunk_size]
+                buffer = buffer[chunk_size:]
+                
+                # Convert to numpy array
+                audio = np.frombuffer(segment, dtype=np.int16).astype(np.float32) / 32768.0
+                
+                # Check for silent chunks
+                rms = np.sqrt(np.mean(audio**2))
+                if rms < 0.001:
+                    logger.warning(f"Silent chunk detected (RMS: {rms:.6f})")
+                
+                # Transcribe
+                segments, _ = model.transcribe(audio, beam_size=3)
+                for seg in segments:
+                    print(f"[{seg.start:.1f}s] {seg.text}")
                     
-        except KeyboardInterrupt:
-            logger.info("Stopped by user")
+        except (BlockingIOError, ValueError, OSError) as e:
+            time.sleep(0.1)
         except Exception as e:
-            logger.error(f"Transcription failed: {e}")
+            logger.error(f"Processing error: {str(e)}")
+            return False
+            
+    return True
+
+def transcribe_hls():
+    """Main transcription workflow for HLS"""
+    logger.info("Initializing Whisper model...")
+    model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="float32")
+    
+    retry_count = 0
+    while retry_count < MAX_RETRIES:
+        logger.info(f"Attempt {retry_count + 1}/{MAX_RETRIES}")
+        
+        # Get HLS URL
+        stream_url = get_hls_url()
+        if not stream_url:
+            retry_count += 1
+            time.sleep(5)
+            continue
+        
+        logger.info(f"Stream URL obtained: {stream_url[:80]}...")
+        
+        # Start FFmpeg
+        process = setup_stream(stream_url)
+        if not process:
+            retry_count += 1
+            time.sleep(5)
+            continue
+        
+        # Process stream
+        try:
+            logger.info("Starting HLS transcription...")
+            if not process_audio_stream(process, model):
+                logger.warning("Stream processing ended unexpectedly")
+        except Exception as e:
+            logger.error(f"Stream error: {str(e)}")
         finally:
-            if self.ffmpeg_process:
-                self.ffmpeg_process.terminate()
-                logger.info("FFmpeg process terminated")
+            logger.info("Cleaning up FFmpeg process...")
+            try:
+                process.terminate()
+                process.wait(timeout=2)
+            except:
+                pass
+        
+        retry_count += 1
+        logger.info(f"Restarting in 5 seconds...")
+        time.sleep(5)
+
+    logger.error("Max retries reached. Exiting.")
 
 if __name__ == "__main__":
-    config = TranscriberConfig(
-        chunk_duration=5, 
-        model_size="small", 
-        sample_rate=16000, 
-        language="en"
-    )
-    transcriber = YouTubeTranscriber(config)
-
-    youtube_url = input("Enter YouTube Live URL: ").strip()
-
-    audio_url = transcriber._get_audio_url(youtube_url)
-    # print(f"[INFO] Streaming from: {audio_url}")
-    transcriber.transcribe_stream(youtube_url)
-        
+    try:
+        transcribe_hls()
+    except KeyboardInterrupt:
+        logger.info("Stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {str(e)}")
