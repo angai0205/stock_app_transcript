@@ -3,275 +3,213 @@ import numpy as np
 from faster_whisper import WhisperModel
 import ffmpeg
 import time
-from datetime import datetime
+import logging
+import os
+import librosa
+from scipy import signal 
 
-# Configuration - KEEP THESE THE SAME AS YOUR WORKING VERSION
-YOUTUBE_URL = "https://www.youtube.com/watch?v=MfDZN_gqy0Q"
-MODEL_SIZE = "small"
-USE_GPU = False
-SEGMENT_LENGTH = 10
+# Configuration
+YOUTUBE_URL = "https://www.youtube.com/watch?v=lsx5ErH3k5o"
+MODEL_SIZE = "base"  # Good balance of speed and accuracy
+SEGMENT_LENGTH = 5  # Process 5-second chunks
+READ_TIMEOUT = 10  # Seconds to wait for data
+MAX_RETRIES = 3  # Max connection attempts
+BUFFER_SIZE = 4096  # Read buffer size
 
-# ONLY ADDITION: Debug logging
-def debug_log(message):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+# Logging setup
+logging.basicConfig(
+    level=logging.WARNING,
+    format='[%(asctime)s.%(msecs)03d] %(message)s',
+    datefmt='%H:%M:%S',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger()
 
-# Initialize model - EXACTLY AS YOUR WORKING VERSION
-try:
-    model = WhisperModel(
-        MODEL_SIZE,
-        device="cuda" if USE_GPU else "cpu",
-        compute_type="float32"
-    )
-    debug_log("Model loaded successfully")
-except Exception as e:
-    debug_log(f"Failed to load model: {str(e)}")
-    exit(1)
-
-# get_stream_url - ENHANCED FOR LIVE STREAMS
-def get_stream_url():
-    try:
-        # First try to get the best audio format for live streams
-        cmd = [
-            "yt-dlp",
-            "-g",
-            "-f", "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio[ext=mp3]/bestaudio",
-            "--no-check-certificates",
-            "--live-from-start",  # Important for live streams
-            YOUTUBE_URL
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        stream_url = result.stdout.strip()
-        
-        if stream_url:
-            debug_log("Successfully got stream URL")
-            return stream_url
-        else:
-            debug_log("No stream URL returned, trying fallback...")
-            
-            # Fallback: try without live-from-start
-            cmd_fallback = [
+def get_hls_url():
+    """Get stream URL with live stream support"""
+    # For live streams, try these formats in order
+    formats_to_try = [
+        "best[ext=m4a]",  # Best audio quality
+        "bestaudio[ext=m4a]",  # Best audio in m4a
+        "best[height<=720]",  # Fallback to video with audio
+        "bestaudio",  # Any best audio
+        "best",  # Final fallback
+    ]
+    
+    for fmt in formats_to_try:
+        try:
+            cmd = [
                 "yt-dlp",
                 "-g",
-                "-f", "bestaudio",
+                "-f", fmt,
                 "--no-check-certificates",
+                "--force-ipv4",
                 YOUTUBE_URL
             ]
-            result_fallback = subprocess.run(cmd_fallback, capture_output=True, text=True, check=True)
-            fallback_url = result_fallback.stdout.strip()
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True, timeout=15, check=True)  # Longer timeout for live
             
-            if fallback_url:
-                debug_log("Successfully got fallback stream URL")
-                return fallback_url
-            else:
-                debug_log("No fallback URL available")
-                return None
-                
-    except subprocess.CalledProcessError as e:
-        debug_log(f"Error getting stream URL: {e.stderr}")
+            url = result.stdout.strip()
+            if url:
+                logger.info(f"Success with format: {fmt}")
+                return url.split('\n')[-1]
+            
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Format {fmt} failed: {e.stderr[:200]}...")
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Timeout getting URL for format {fmt}")
+    
+    logger.error("All format attempts failed")
+    return None
+
+def is_live_stream(url):
+    """Check if URL is a live stream"""
+    try:
+        cmd = ["yt-dlp", "--print", "is_live", url]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                              text=True, timeout=10, check=True)
+        return result.stdout.strip().lower() == "true"
+    except:
+        return False
+
+def setup_stream(url, is_live=False):
+    """Configure FFmpeg for streaming with live stream optimizations"""
+    try:
+        input_options = {
+            'headers': 'Referer: https://www.youtube.com\r\nUser-Agent: Mozilla/5.0',
+            'fflags': '+discardcorrupt+genpts+nobuffer',
+            'flags': 'low_delay',
+            'timeout': '10000000',
+        }
+        
+        if is_live:
+            # Additional options for live streams
+            input_options.update({
+                'reconnect': '1',
+                'reconnect_at_eof': '1',
+                'reconnect_streamed': '1',
+                'reconnect_delay_max': '30',
+                'live_start_index': '0',
+            })
+        
+        return (
+            ffmpeg
+            .input(url, **input_options)
+            .output(
+                'pipe:',
+                format='s16le',
+                ac=1,
+                ar=16000,
+                acodec='pcm_s16le',
+                loglevel='error',
+                map='a:0'
+            )
+            .global_args('-nostdin')
+            .run_async(pipe_stdout=True, pipe_stderr=True)
+        )
+    except ffmpeg.Error as e:
+        logger.error(f"FFmpeg setup failed: {e.stderr.decode('utf8', 'replace')}")
         return None
 
-# process_stream - CORE LOGIC REMAINS THE SAME
-def process_stream():
-    stream_url = get_stream_url()
-    if not stream_url:
-        debug_log("Failed to get stream URL")
-        return
-
-    debug_log(f"Stream URL: {stream_url}")
-    
-    # Check if this is likely a live stream (HLS or DASH)
-    is_live_stream = any(keyword in stream_url.lower() for keyword in ['m3u8', 'manifest', 'playlist', 'dash'])
-    debug_log(f"Detected live stream: {is_live_stream}")
-
-    # FFmpeg pipeline - ENHANCED FOR LIVE STREAMS
-    try:
-        if is_live_stream:
-            # Enhanced configuration for live streams (both HLS and DASH)
-            input_args = {
-                'protocol_whitelist': 'file,http,https,tcp,tls',
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'headers': 'Referer: https://www.youtube.com/',
-                'fflags': '+discardcorrupt+genpts'
-            }
-            
-            # Add format-specific options
-            if 'm3u8' in stream_url.lower():
-                input_args['f'] = 'm3u8'
-                input_args['live_start_index'] = '0'
-                debug_log("Using HLS configuration")
-            elif 'dash' in stream_url.lower():
-                input_args['f'] = 'dash'
-                debug_log("Using DASH configuration")
-            else:
-                debug_log("Using generic live stream configuration")
-            
-            try:
-                process = (
-                    ffmpeg
-                    .input(stream_url, **input_args)
-                    .output('pipe:', 
-                           format='s16le',
-                           acodec='pcm_s16le',
-                           ac=1,
-                           ar=16000,
-                           loglevel='error')
-                    .overwrite_output()
-                    .run_async(pipe_stdout=True, pipe_stderr=True)
-                )
-                debug_log("Enhanced FFmpeg configuration started successfully")
-            except ffmpeg.Error as e:
-                debug_log(f"Enhanced configuration failed: {e.stderr.decode('utf8', 'replace')}")
-                debug_log("Trying fallback configuration...")
-                
-                # Fallback: simpler configuration
-                process = (
-                    ffmpeg
-                    .input(stream_url, 
-                           protocol_whitelist='file,http,https,tcp,tls',
-                           user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
-                    .output('pipe:', 
-                           format='s16le',
-                           acodec='pcm_s16le',
-                           ac=1,
-                           ar=16000,
-                           loglevel='error')
-                    .overwrite_output()
-                    .run_async(pipe_stdout=True, pipe_stderr=True)
-                )
-                debug_log("Fallback FFmpeg configuration started successfully")
-        else:
-            # Standard configuration for regular videos
-            process = (
-                ffmpeg
-                .input(stream_url, **{'protocol_whitelist': 'file,http,https,tcp,tls'})
-                .output('pipe:', format='s16le', ac=1, ar='16000')
-                .run_async(pipe_stdout=True, pipe_stderr=True)
-            )
-        
-        debug_log("FFmpeg started successfully")
-    except ffmpeg.Error as e:
-        debug_log(f"FFmpeg error: {e.stderr.decode('utf8', 'replace')}")
-        return
-
-    # Audio processing - ENHANCED FOR LIVE STREAMS
+def process_audio_stream(process, model):
+    """Core audio processing with HLS optimizations"""
     sample_rate = 16000
-    bytes_per_sample = 2
-    chunk_size = sample_rate * SEGMENT_LENGTH * bytes_per_sample
+    chunk_size = sample_rate * SEGMENT_LENGTH * 2  # 16-bit samples
     buffer = b''
-    bytes_received = 0
-    chunks_processed = 0
+    last_data_time = time.time()
     
-    debug_log(f"Chunk size: {chunk_size} bytes ({SEGMENT_LENGTH}s of audio)")
-    
-    try:
-        debug_log("Starting transcription...")
-        last_data_time = time.time()
-        consecutive_empty_reads = 0
-        max_wait_time = 10.0  # Wait up to 10 seconds for data
-        
-        while True:
-            # Read audio - ENHANCED FOR LIVE STREAMS
-            raw_data = process.stdout.read(8192)  # Increased buffer size for live streams
+    while True:
+        # Check for timeout
+        if time.time() - last_data_time > READ_TIMEOUT:
+            logger.warning(f"No data for {READ_TIMEOUT}s - restarting")
+            return False
             
-            if not raw_data:
-                consecutive_empty_reads += 1
-                current_time = time.time()
-                
-                # Check if we've been waiting too long
-                if current_time - last_data_time > max_wait_time:
-                    debug_log(f"No audio data for {max_wait_time} seconds, checking FFmpeg status...")
-                    
-                    # Check if FFmpeg process is still running
-                    if process.poll() is not None:
-                        debug_log(f"FFmpeg process has exited with code {process.returncode}")
-                        # Read any remaining stderr output
-                        stderr_output = process.stderr.read().decode('utf8', 'replace')
-                        if stderr_output:
-                            debug_log(f"FFmpeg stderr: {stderr_output}")
-                        break
-                    else:
-                        debug_log("FFmpeg process is still running but not providing data")
-                        # Try to read stderr to see if there are any error messages
-                        try:
-                            stderr_output = process.stderr.read1(1024).decode('utf8', 'replace')
-                            if stderr_output:
-                                debug_log(f"FFmpeg stderr: {stderr_output}")
-                        except:
-                            pass
-                        break
-                
-                # Small delay to prevent excessive CPU usage
+        # Read data
+        try:
+            data = os.read(process.stdout.fileno(), BUFFER_SIZE)
+            if not data:
                 time.sleep(0.1)
                 continue
-            
-            # Reset counters when we get data
-            consecutive_empty_reads = 0
+                
             last_data_time = time.time()
-            bytes_received += len(raw_data)
-            buffer += raw_data
+            buffer += data
             
-            # Only log every 10th read to reduce spam
-            if bytes_received % (8192 * 10) == 0:
-                debug_log(f"Received {len(raw_data)} bytes, total: {bytes_received}, buffer: {len(buffer)}")
-            
-            # Process chunks - ENHANCED DEBUGGING
+            # Process complete chunks
             while len(buffer) >= chunk_size:
                 segment = buffer[:chunk_size]
                 buffer = buffer[chunk_size:]
-                chunks_processed += 1
-                
-                debug_log(f"Processing chunk {chunks_processed} ({len(segment)} bytes)")
                 
                 # Convert to numpy array
-                audio_np = np.frombuffer(segment, dtype=np.int16).astype(np.float32) / 32768.0
+                audio = np.frombuffer(segment, dtype=np.int16).astype(np.float32) / 32768.0
                 
-                # Check if audio has actual content (not just silence)
-                audio_rms = np.sqrt(np.mean(audio_np**2))
-                if audio_rms < 0.001:  # Very low volume
-                    debug_log(f"Chunk {chunks_processed} appears to be silence (RMS: {audio_rms:.6f})")
+                # Check for silent chunks
+                rms = np.sqrt(np.mean(audio**2))
+                if rms < 0.001:
+                    logger.warning(f"Silent chunk detected (RMS: {rms:.6f})")
                 
-                try:
-                    segments, info = model.transcribe(
-                        audio_np,
-                        beam_size=5,
-                        language="en",
-                        vad_filter=True
-                    )
+                # Transcribe
+                segments, _ = model.transcribe(audio, beam_size=3)
+                for seg in segments:
+                    print(f"[{seg.start:.1f}s] {seg.text}")
                     
-                    if segments:
-                        for segment in segments:
-                            print(f"[{segment.start:.2f}s] {segment.text}")
-                    else:
-                        debug_log(f"Chunk {chunks_processed}: No speech detected")
-                        
-                except Exception as e:
-                    debug_log(f"Transcription error in chunk {chunks_processed}: {str(e)}")
+        except (BlockingIOError, ValueError, OSError) as e:
+            time.sleep(0.1)
+        except Exception as e:
+            logger.error(f"Processing error: {str(e)}")
+            return False
             
-            # Periodic status - ENHANCED
-            if bytes_received % (1024 * 100) == 0:  # Log every ~100KB
-                debug_log(f"Received {bytes_received/1024:.1f}KB, processed {chunks_processed} chunks, buffer: {len(buffer)} bytes")
+    return True
 
-    except KeyboardInterrupt:
-        debug_log("\nStopping transcription...")
-    finally:
-        process.terminate()
-        debug_log(f"Finished. Total received: {bytes_received/1024:.1f}KB, processed {chunks_processed} chunks")
+def transcribe_hls():
+    """Main transcription workflow for HLS"""
+    logger.info("Initializing Whisper model...")
+    model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="float32")
+    
+    retry_count = 0
+    while retry_count < MAX_RETRIES:
+        logger.info(f"Attempt {retry_count + 1}/{MAX_RETRIES}")
         
-        # Process any remaining buffer
-        if len(buffer) > 0:
-            debug_log(f"Processing final {len(buffer)} bytes of buffer...")
+        # Get HLS URL
+        stream_url = get_hls_url()
+        if not stream_url:
+            retry_count += 1
+            time.sleep(5)
+            continue
+        
+        logger.info(f"Stream URL obtained: {stream_url[:80]}...")
+        
+        # Start FFmpeg
+        process = setup_stream(stream_url)
+        if not process:
+            retry_count += 1
+            time.sleep(5)
+            continue
+        
+        # Process stream
+        try:
+            logger.info("Starting HLS transcription...")
+            if not process_audio_stream(process, model):
+                logger.warning("Stream processing ended unexpectedly")
+        except Exception as e:
+            logger.error(f"Stream error: {str(e)}")
+        finally:
+            logger.info("Cleaning up FFmpeg process...")
             try:
-                audio_np = np.frombuffer(buffer, dtype=np.int16).astype(np.float32) / 32768.0
-                segments, info = model.transcribe(
-                    audio_np,
-                    beam_size=5,
-                    language="en",
-                    vad_filter=True
-                )
-                for segment in segments:
-                    print(f"[{segment.start:.2f}s] {segment.text}")
-            except Exception as e:
-                debug_log(f"Error processing final buffer: {str(e)}")
+                process.terminate()
+                process.wait(timeout=2)
+            except:
+                pass
+        
+        retry_count += 1
+        logger.info(f"Restarting in 5 seconds...")
+        time.sleep(5)
+
+    logger.error("Max retries reached. Exiting.")
 
 if __name__ == "__main__":
-    process_stream()
+    try:
+        transcribe_hls()
+    except KeyboardInterrupt:
+        logger.info("Stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {str(e)}")
