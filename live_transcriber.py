@@ -9,11 +9,12 @@ import librosa
 from googletrans import Translator, LANGUAGES
 import threading
 from queue import Queue
+from collections import deque
 
 # Configuration
 YOUTUBE_URL = "https://www.youtube.com/watch?v=iEpJwprxDdk"
 MODEL_SIZE = "base"  
-SEGMENT_LENGTH = 5 
+SEGMENT_LENGTH = 10
 READ_TIMEOUT = 10  
 MAX_RETRIES = 3  
 BUFFER_SIZE = 4096  
@@ -26,11 +27,15 @@ MIN_SPEECH_DURATION = 1.0
 SKIP_MUSIC_DETECTION = True
 
 # Language Config
-TARGET_LANGUAGE = "zh-CN"
+TARGET_LANGUAGE = "en"
 ENABLE_TRANSLATION = True
 TRANSLATION_TIMEOUT = 5
 
 translator = Translator()
+
+output_buffer = deque()
+
+SYNC_DELAY = 5
 
 # Logging setup - Option 2: Separate log file
 def setup_logging_to_file():
@@ -286,6 +291,7 @@ def process_audio_stream(process, model):
                         if seg.text.strip():
                             original_text = seg.text.strip()
                             if not original_text or original_text == ".":
+                                original_text = "(Music)"
                                 continue  # Skip silence markers or garbage
                             
                             if ENABLE_TRANSLATION:
