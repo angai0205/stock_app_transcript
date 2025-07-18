@@ -1,0 +1,6 @@
+faster-whisper
+ffmpeg-python
+numpy
+librosa
+googletrans==4.0.0-rc1
+yt-dlp
